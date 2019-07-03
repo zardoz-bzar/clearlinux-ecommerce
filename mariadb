@@ -1,0 +1,96 @@
+Assume sudo exeuction or root as necessary. This isn't a script yet, its a guide for now.
+
+The purpose is for running mariadb on clearlinux on a public cloud host to backend an ecommerce system like woocommerce.
+Public cloud hosts play with with rocksdb 4k writes, and clearlinux compresses data using every trick in the intel cpu.
+
+Stage1: update the base image you uploaded into cloud, and hit the turbo button
+
+swupd update
+#weight your risk v. reward here, i disable this because cloud hosts fix these at the hw microcode level
+grep -q "mitigations=off" /boot/syslinux.cfg || echo " mitigations=off " >> /boot/syslinux.cfg
+#this disables linux kernel mitigation code for intel cpu exploits by adding it to the end
+#of the last APPEND string in the file
+
+mkdir /etc/systemd/system.conf.d
+cat >> /etc/systemd/system.conf.d/50-nfiles.conf << EOF
+[Manager]
+DefaultLimitNOFILE=65535
+EOF
+
+mkdir -p /etc/sysctl.d
+cat >> /etc/sysctl.d/99-net-core-somaxconn.conf << EOF
+net.core.somaxconn = 65535
+EOF
+
+reboot
+
+Stage 1.5:
+If you are in google cloud, you probably want to swupd bundle-add python2-basic and curl.
+You need a working version of gsutil to pull your my.cnf down to the VM since ClearLinux is stateless.
+The ClearLinux gsutil hasn't worked in forever, you need the Google SDK.
+
+Stage2: 
+
+swupd bundle-add mariadb
+mkdir -p /etc/mariadb /var/log/mysql /var/lib/mysql /var/run/mariadb
+chown mysql:mysql /etc/mariadb /var/log/mysql /var/lib/mysql /var/run/mariadb 
+## gce example # gsutil cp gs://your_bucket/my.cnf /etc/mariadb/
+# don't overcomplicate mariadb config
+# clearlinux is stateless
+# have a single my.cnf file with all the proper settings that you drop in /etc/mariadb
+# Note: it took some trial and error to figure which directories it was trying to use by default
+
+#this is a horrible hack for this
+ln -s /usr/lib64/mysql/plugin/ha_rocksdb.so.avx2 /usr/lib64/mysql/plugin/ha_rocksdb.so.avx2.so
+#this works around the behavior of mariadb which just takes your "plugin-load" var and globs .so on the end
+
+#note, if you want to use rocksdb, clear can't autoload the avx2 optimized version
+# you will need to run either:
+# plugin-load                     = ha_rocksdb.so.avx2
+# plugin-load                     = ha_rocksdb
+# this depends on whether your processor supports avx2, check /proc/cpuinfo
+
+Important Notes:
+1. jemalloc isn't in any trim bundle you can addon easily for clearlinux
+2. grab the rpm from their pkgs repo, extra the lib, put in /usr/local/lib
+
+my.cnf sample snippets:
+
+#You want this in my.cnf for lean and mean malloc:
+[mysqld_safe]
+malloc-lib      = /usr/local/lib/libjemalloc.so.2
+socket          = /var/run/mariadb/mariadb.sock
+nice            = 0
+
+#bugs with utf8mb4 were fixed a while back
+#the default memory buffer is half a gig for rocksdb
+#here is the thing, most of your db files will be stored in OS buffers compressed
+#the rockdb uncompressed memory buffer can be increased, but...
+#clearlinux has aggressively optimized compression libs so the penalty is low...
+#so tune that to your liking
+#TL;DR: rocksdb_block_cache_size is not innodb_buffer_pool_size at all
+[mysql]
+plugin-load                     = ha_rocksdb.so.avx2 #note, this took a hack above to work
+default-storage-engine          = ROCKSDB
+default-tmp-storage-engine      = MyISAM
+binlog_format                   = ROW
+collation-server                = utf8mb4_bin
+character-set-server            = utf8mb4
+transaction-isolation           = READ-COMMITTED
+
+systemctl enable mariadb
+systemctl start mariadb
+#mysql_secure_ins-whatever is a garbage script
+#run the same commands it does, but without an expect wrapper
+#this is a cloud cattle car, not a multiuser system
+export PASS=MYVAL
+mysql -uroot -e "UPDATE mysql.user SET Password=PASSWORD('$PASS') WHERE User='root';"
+mysql -uroot -p$PASS -e "FLUSH PRIVILEGES;"
+mysql -uroot -p$PASS -e "DELETE FROM mysql.user WHERE User='';"
+mysql -uroot -p$PASS -e "DROP DATABASE IF EXISTS test;"
+mysql -uroot -p$PASS -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'"
+mysql -uroot -p$PASS -e "FLUSH PRIVILEGES;"
+#this disabled everything but remove root login, which in a private VPC you might want on
+#but here's the part that does it, ripped out of that script 
+#mysql -uroot -p$PASS -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
+#mysql -uroot -p$PASS -e "FLUSH PRIVILEGES;"
